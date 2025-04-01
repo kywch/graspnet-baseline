@@ -16,7 +16,9 @@ pip = ">=25.0.1,<26"
 cython = ">=3.0.11,<4"
 setuptools = "<60"
 wheel = ">=0.45.1,<0.46"
+
 ruff = ">=0.11.2,<0.12"
+wandb = ">=0.19.8,<0.20"
 
 # cuda build dependencies
 # necessary for MinkowskiEngine
@@ -40,4 +42,3 @@ open3d = ">=0.18.0, <0.19"
 graspnetAPI = { git = "https://github.com/kywch/graspnetAPI.git" }
 knn_pytorch = { path = "./knn" }
 pointnet2 = { path = "./pointnet2" }
-tensorboard = ">=2.19.0, <3"

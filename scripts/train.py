@@ -5,11 +5,9 @@ import argparse
 from datetime import datetime
 
 import torch
-import torch.nn as nn
 import torch.optim as optim
-from torch.optim import lr_scheduler
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
+import wandb
 
 import numpy as np
 from pointnet2.pytorch_utils import BNMomentumScheduler
@@ -150,13 +148,6 @@ def adjust_learning_rate(optimizer, epoch):
         param_group["lr"] = lr
 
 
-# TensorBoard Visualizers
-TRAIN_WRITER = SummaryWriter(os.path.join(cfgs.log_dir, "train"))
-TEST_WRITER = SummaryWriter(os.path.join(cfgs.log_dir, "test"))
-
-# ------------------------------------------------------------------------- GLOBAL CONFIG END
-
-
 def train_one_epoch():
     stat_dict = {}  # collect statistics
     adjust_learning_rate(optimizer, EPOCH_CNT)
@@ -186,18 +177,14 @@ def train_one_epoch():
         for key in end_points:
             if "loss" in key or "acc" in key or "prec" in key or "recall" in key or "count" in key:
                 if key not in stat_dict:
-                    stat_dict[key] = 0
-                stat_dict[key] += end_points[key].item()
+                    stat_dict["train/" + key] = 0
+                stat_dict["train/" + key] += end_points[key].item()
 
-        batch_interval = 10
+        batch_interval = 100
         if (batch_idx + 1) % batch_interval == 0:
             log_string(" ---- batch: %03d ----" % (batch_idx + 1))
+            wandb.log(stat_dict, step=EPOCH_CNT * len(TRAIN_DATALOADER) + batch_idx)
             for key in sorted(stat_dict.keys()):
-                TRAIN_WRITER.add_scalar(
-                    key,
-                    stat_dict[key] / batch_interval,
-                    (EPOCH_CNT * len(TRAIN_DATALOADER) + batch_idx) * cfgs.batch_size,
-                )
                 log_string("mean %s: %f" % (key, stat_dict[key] / batch_interval))
                 stat_dict[key] = 0
 
@@ -228,13 +215,11 @@ def evaluate_one_epoch():
         for key in end_points:
             if "loss" in key or "acc" in key or "prec" in key or "recall" in key or "count" in key:
                 if key not in stat_dict:
-                    stat_dict[key] = 0
-                stat_dict[key] += end_points[key].item()
+                    stat_dict["eval/" + key] = 0
+                stat_dict["eval/" + key] += end_points[key].item()
 
+    wandb.log(stat_dict, step=(EPOCH_CNT+1) * len(TRAIN_DATALOADER))
     for key in sorted(stat_dict.keys()):
-        TEST_WRITER.add_scalar(
-            key, stat_dict[key] / float(batch_idx + 1), (EPOCH_CNT + 1) * len(TRAIN_DATALOADER) * cfgs.batch_size
-        )
         log_string("eval mean %s: %f" % (key, stat_dict[key] / (float(batch_idx + 1))))
 
     mean_loss = stat_dict["loss/overall_loss"] / float(batch_idx + 1)
@@ -245,6 +230,9 @@ def train(start_epoch):
     global EPOCH_CNT
     min_loss = 1e10
     loss = 0
+
+    wandb.init(project="graspnet", sync_tensorboard=True)
+
     for epoch in range(start_epoch, cfgs.max_epoch):
         EPOCH_CNT = epoch
         log_string("**** EPOCH %03d ****" % (epoch))
@@ -267,6 +255,8 @@ def train(start_epoch):
         except:
             save_dict["model_state_dict"] = net.state_dict()
         torch.save(save_dict, os.path.join(cfgs.log_dir, "checkpoint.tar"))
+
+    wandb.finish()
 
 
 if __name__ == "__main__":
