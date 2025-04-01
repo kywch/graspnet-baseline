@@ -1,0 +1,43 @@
+[project]
+channels = ["pytorch", "nvidia", "conda-forge"]
+name = "graspnet"
+platforms = ["linux-64"]
+
+[system-requirements]
+cuda = "12.1"
+
+[activation]
+scripts = ["env_setup.sh"]
+
+[dependencies]
+python = ">=3.10,<3.11"
+
+pip = ">=25.0.1,<26"
+cython = ">=3.0.11,<4"
+setuptools = "<60"
+wheel = ">=0.45.1,<0.46"
+ruff = ">=0.11.2,<0.12"
+
+# cuda build dependencies
+# necessary for MinkowskiEngine
+gxx_linux-64 = "<13"
+cuda-version = "12.1.*"
+cuda-toolkit = "==12.1"
+cuda-nvcc = "12.1.*"
+openblas = ">=0.3.29,<0.4"
+ninja = ">=1.12.1,<2"
+
+numpy = "==1.23.3"
+pytorch = "==2.3.1"
+pytorch-cuda = "==12.1"
+scipy = ">=1.13.1,<2"
+scikit-learn = ">=1.6.1,<2"
+torchvision = ">=0.18.1,<0.19"
+
+
+[pypi-dependencies]
+open3d = ">=0.18.0, <0.19"
+graspnetAPI = { git = "https://github.com/kywch/graspnetAPI.git" }
+knn_pytorch = { path = "./knn" }
+pointnet2 = { path = "./pointnet2" }
+tensorboard = ">=2.19.0, <3"
