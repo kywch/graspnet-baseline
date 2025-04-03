@@ -3,7 +3,6 @@ Author: chenxi-wang
 """
 
 import os
-import sys
 import collections.abc as container_abcs
 
 import numpy as np
@@ -22,12 +21,6 @@ from graspnet.data_utils import (
     get_workspace_mask,
     remove_invisible_grasp_points,
 )
-
-# BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-# ROOT_DIR = os.path.dirname(BASE_DIR)
-# sys.path.append(os.path.join(ROOT_DIR, 'utils'))
-# from data_utils import CameraInfo, transform_point_cloud, create_point_cloud_from_depth_image,\
-#                             get_workspace_mask, remove_invisible_grasp_points
 
 
 class GraspNetDataset(Dataset):
@@ -119,7 +112,7 @@ class GraspNetDataset(Dataset):
         else:
             return self.get_data(index)
 
-    def get_data(self, index, return_raw_cloud=False):
+    def _load_files_and_create_cloud(self, index):
         color = np.array(Image.open(self.colorpath[index]), dtype=np.float32) / 255.0
         depth = np.array(Image.open(self.depthpath[index]))
         seg = np.array(Image.open(self.labelpath[index]))
@@ -140,7 +133,7 @@ class GraspNetDataset(Dataset):
 
         # get valid points
         depth_mask = depth > 0
-        seg_mask = seg > 0
+        # seg_mask = seg > 0  # NOTE: doesn't seem to be used
         if self.remove_outlier:
             camera_poses = np.load(os.path.join(self.root, "scenes", scene, self.camera, "camera_poses.npy"))
             align_mat = np.load(os.path.join(self.root, "scenes", scene, self.camera, "cam0_wrt_table.npy"))
@@ -152,6 +145,11 @@ class GraspNetDataset(Dataset):
         cloud_masked = cloud[mask]
         color_masked = color[mask]
         seg_masked = seg[mask]
+
+        return cloud_masked, color_masked, seg_masked, meta
+
+    def get_data(self, index, return_raw_cloud=False):
+        cloud_masked, color_masked, _, _ = self._load_files_and_create_cloud(index)
         if return_raw_cloud:
             return cloud_masked, color_masked
 
@@ -172,40 +170,10 @@ class GraspNetDataset(Dataset):
         return ret_dict
 
     def get_data_label(self, index):
-        color = np.array(Image.open(self.colorpath[index]), dtype=np.float32) / 255.0
-        depth = np.array(Image.open(self.depthpath[index]))
-        seg = np.array(Image.open(self.labelpath[index]))
-        meta = scio.loadmat(self.metapath[index])
+        cloud_masked, color_masked, seg_masked, meta = self._load_files_and_create_cloud(index)
+        obj_idxs = meta["cls_indexes"].flatten().astype(np.int32)
+        poses = meta["poses"]
         scene = self.scenename[index]
-        try:
-            obj_idxs = meta["cls_indexes"].flatten().astype(np.int32)
-            poses = meta["poses"]
-            intrinsic = meta["intrinsic_matrix"]
-            factor_depth = meta["factor_depth"]
-        except Exception as e:
-            print(repr(e))
-            print(scene)
-        camera = CameraInfo(
-            1280.0, 720.0, intrinsic[0][0], intrinsic[1][1], intrinsic[0][2], intrinsic[1][2], factor_depth
-        )
-
-        # generate cloud
-        cloud = create_point_cloud_from_depth_image(depth, camera, organized=True)
-
-        # get valid points
-        depth_mask = depth > 0
-        seg_mask = seg > 0
-        if self.remove_outlier:
-            camera_poses = np.load(os.path.join(self.root, "scenes", scene, self.camera, "camera_poses.npy"))
-            align_mat = np.load(os.path.join(self.root, "scenes", scene, self.camera, "cam0_wrt_table.npy"))
-            trans = np.dot(align_mat, camera_poses[self.frameid[index]])
-            workspace_mask = get_workspace_mask(cloud, seg, trans=trans, organized=True, outlier=0.02)
-            mask = depth_mask & workspace_mask
-        else:
-            mask = depth_mask
-        cloud_masked = cloud[mask]
-        color_masked = color[mask]
-        seg_masked = seg[mask]
 
         # sample points
         if len(cloud_masked) >= self.num_points:
@@ -307,7 +275,13 @@ if __name__ == "__main__":
     root = "/workspace/dataset/graspnet"
     valid_obj_idxs, grasp_labels = load_grasp_labels(root)
     train_dataset = GraspNetDataset(
-        root, valid_obj_idxs, grasp_labels, split="train", remove_outlier=True, remove_invisible=True, num_points=20000
+        root,
+        valid_obj_idxs,
+        grasp_labels,
+        split="test_seen",
+        remove_outlier=True,
+        remove_invisible=True,
+        num_points=20000,
     )
     print(len(train_dataset))
 

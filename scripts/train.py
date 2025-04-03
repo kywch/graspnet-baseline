@@ -218,11 +218,11 @@ def evaluate_one_epoch():
                     stat_dict["eval/" + key] = 0
                 stat_dict["eval/" + key] += end_points[key].item()
 
-    wandb.log(stat_dict, step=(EPOCH_CNT+1) * len(TRAIN_DATALOADER))
+    wandb.log(stat_dict, step=(EPOCH_CNT + 1) * len(TRAIN_DATALOADER))
     for key in sorted(stat_dict.keys()):
         log_string("eval mean %s: %f" % (key, stat_dict[key] / (float(batch_idx + 1))))
 
-    mean_loss = stat_dict["loss/overall_loss"] / float(batch_idx + 1)
+    mean_loss = stat_dict["eval/loss/overall_loss"] / float(batch_idx + 1)
     return mean_loss
 
 
