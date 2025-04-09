@@ -42,3 +42,5 @@ open3d = ">=0.18.0, <0.19"
 graspnetAPI = { git = "https://github.com/kywch/graspnetAPI.git" }
 knn_pytorch = { path = "./knn" }
 pointnet2 = { path = "./pointnet2" }
+robosuite = {path = "./robosuite", editable = true}
+robosuite-models = ">=1.0.0, <2"
