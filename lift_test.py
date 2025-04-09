@@ -308,8 +308,9 @@ if __name__ == "__main__":
     # The action[3:6] must produce the same rotation matrix
     # It can be done with: Rotation.from_matrix(best_grasp.rotation_matrix).as_rotvec()
 
-    rot_y_90 = np.array([[0, 0, 1], [0, 1, 0], [-1, 0, 0]])
-    target_ori = Rotation.from_matrix(best_grasp.rotation_matrix @ rot_y_90).as_rotvec().tolist()
+    switch_axis = np.array([[0, 0, 1], [1, 0, 0], [0, 1, 0]])
+    # NOTE: when the rotation matrix is identity, the gripper should face toward the x-axis, flat on x-y plane
+    target_ori = Rotation.from_matrix(best_grasp.rotation_matrix @ switch_axis).as_rotvec().tolist()
     # target_ori = [0, 0, 0]
 
     eef_target = np.array(target_pos + target_ori + [-1])
@@ -359,6 +360,10 @@ if __name__ == "__main__":
         time.sleep(0.05)
 
     # Step 4: Lift the object
+    # zero_ori = Rotation.from_matrix(switch_axis).as_rotvec().tolist()
+    # NOTE: zero_ori should make the gripper face toward the x-axis, flat on x-y plane,
+    #       which is the default orientation in the AnyGrasp dataset
+    # eef_target = np.array([0, 0, 1.2] + zero_ori + [1])
     eef_target = np.array([0, 0, 1.2, np.pi, 0, 0, 1])
     for i in range(50):
         env.step(eef_target)
