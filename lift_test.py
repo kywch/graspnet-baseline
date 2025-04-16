@@ -19,6 +19,7 @@ import robosuite.utils.camera_utils as CU
 
 from robosuite.utils.camera_utils import project_points_from_world_to_camera as project_world_to_pixel
 from robosuite.controllers.composite.composite_controller_factory import refactor_composite_controller_config
+from robosuite.controllers import load_part_controller_config
 
 
 # the distance threshold for a grasp candidate to be considered a valid grasp for the object (or clicked point)
@@ -34,7 +35,7 @@ def make_env(camera_name, camera_height, camera_width):
 
     robot = "Panda"
 
-    controller_config = robosuite.load_part_controller_config(default_controller="OSC_POSE")
+    controller_config = load_part_controller_config(default_controller="OSC_POSE")
     controller_config["input_type"] = "absolute"
     controller_config["input_ref_frame"] = "world"
     controller_config["damping_ratio"] = 3  # make robot slower
@@ -293,7 +294,7 @@ if __name__ == "__main__":
             gg.sort_by_score()
 
             # Apply grasp score threshold
-            if gg[0].score > 0.85:
+            if gg[0].score > 0.7:
                 break
 
     best_grasp = Grasp(gg[0].grasp_array)
@@ -301,7 +302,7 @@ if __name__ == "__main__":
     ### Motion planning -- target pos/ori
     # position x, y, z
     target_pos = best_grasp.translation.tolist()
-    target_pos[2] -= 0.02  # go a bit deeper
+    target_pos[2] -= 0.03  # go a bit deeper
     # target_pos[2] += 0.5
 
     # NOTE: OSC controller -- self.goal_ori = Rotation.from_rotvec(action[3:6]).as_matrix()
@@ -340,6 +341,8 @@ if __name__ == "__main__":
     )
     viewer.user_scn.ngeom = 1
     env.viewer.update()
+
+    input("Press Enter to continue...")
 
     ### Execute the grasp
     # Step 1: Move the gripper to the approach vector
