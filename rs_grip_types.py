@@ -1,7 +1,8 @@
 import time
 import json
-import numpy as np
+from functools import lru_cache
 
+import numpy as np
 import mujoco
 
 import robosuite
@@ -63,19 +64,29 @@ class CustomInspireRightHand(InspireRightHand):
         self._grip_type = "Tripod"
         assert self._grip_type in self.grip_info, "Gripper type {} not found in gripper info!".format(self._grip_type)
 
-        self._grip_hmat = {}
-        self._grip_hmat_inv = {}
         # See AnyDexGrasp mesh generation, open3d for this
         self.eef_to_wrist_hmat = np.eye(4)
         self.eef_to_wrist_hmat[:3, :3] = np.array([[0, 0, 1], [-1, 0, 0], [0, -1, 0]])
+
+        # Offset to apply to the gripper site. TODO: try to get rid of this
+        self._grab_site_offset = np.zeros(3)
 
     def _convert_6d_to_12d(self, action_6d):
         # NOTE: It probably isn't linear like below. AnyDexGrasp used driver_routine_to_angle.xls to map
         return np.array(action_6d)[self._map_6d_to_12d] * self.control_range + self.control_base
 
+    @property
+    def grip_type(self):
+        return self._grip_type
+
     def set_grip_type(self, grip_type):
         assert grip_type in self.grip_info, "Gripper type {} not found in gripper info!".format(grip_type)
         self._grip_type = grip_type
+
+    # TODO: offset should be set for each grip type, and in the gripper frame
+    def set_grab_site_offset(self, offset):
+        assert len(offset) == 3, "Offset must be a 3-element array"
+        self._grab_site_offset = np.array(offset)
 
     def get_grip_to_wrist_hmat(self, grip_type):
         action_to_idx = 10  # int(self.grip_info[self._grip_type]["idx_scale"])  # middle value
@@ -90,38 +101,38 @@ class CustomInspireRightHand(InspireRightHand):
 
         return T.make_pose(trans, rot_mat)  # 4x4 mat
 
+    @lru_cache
     def get_grip_hmat(self, grip_type):
-        if grip_type not in self._grip_hmat:
-            grip_hmat = self.eef_to_wrist_hmat @ self.get_grip_to_wrist_hmat(grip_type)
-            self._grip_hmat[grip_type] = grip_hmat
-        else:
-            grip_hmat = self._grip_hmat[grip_type]
-        return grip_hmat
+        return self.eef_to_wrist_hmat @ self.get_grip_to_wrist_hmat(grip_type)
 
-    def get_grab_site_from_curr_eef(self, env, grip_type):
+    @lru_cache
+    def get_inv_grip_hmat(self, grip_type):
+        return np.linalg.inv(self.get_grip_hmat(grip_type))
+
+    def get_grab_site_from_curr_eef(self, env):
         ref_id = env.sim.model.site_name2id("gripper0_right_grip_site")
         curr_ee_hmat = T.make_pose(env.sim.data.site_xpos[ref_id], env.sim.data.site_xmat[ref_id].reshape((3, 3)))
 
-        grip_hmat = self.get_grip_hmat(grip_type)
+        grip_hmat = self.get_grip_hmat(self._grip_type)
 
         grab_site_hmat = curr_ee_hmat @ grip_hmat
         grab_pos, grab_ori_quat = T.mat2pose(grab_site_hmat)
         grab_ori_mat = T.quat2mat(grab_ori_quat)
 
-        return grab_pos, grab_ori_mat
+        # Apply offset to the target gripper site
+        return grab_pos - self._grab_site_offset, grab_ori_mat
 
-    # TODO: complete this
-    def get_eef_pose_for_grab(self, grab_pos, grab_ori_aa):
+    def get_eef_pose_for_grab(self, grab_pos, grab_ori_mat):
         """Given grab pos and ori_aa, return the eef pose to feed to the controller"""
-        pass
-        # grip_hmat = self.get_grip_hmat(self._grip_type)
 
-        # target_quat = T.axisangle2quat(target_ori_aa)
-        # target_hmat = T.make_pose(target_pos, T.quat2mat(target_quat))
+        # Apply offset to the target gripper site
+        grab_site_hmat = T.make_pose(grab_pos + self._grab_site_offset, grab_ori_mat)
+        
+        eef_hmat = grab_site_hmat @ self.get_inv_grip_hmat(self._grip_type)
+        eef_pos, eef_quat = T.mat2pose(eef_hmat)
+        eef_ori_aa = T.quat2axisangle(eef_quat)
 
-        # # NOTE: These go to the controller, so that the grab site is at target_pos/ori
-        # pos, ori_quat = T.mat2pose(target_hmat)
-        # return pos, T.quat2axisangle(ori_quat)
+        return eef_pos, eef_ori_aa
 
     def format_action(self, action):
         assert len(action) == self.dof, "Action dimension {} does not match the gripper dof {}".format(
@@ -157,6 +168,8 @@ class CustomPanda(Panda):
                 )    
     """
 
+    # A github issue shows that changing the robot/hand xml file can get rid of this offset
+    # https://github.com/ARISE-Initiative/robosuite/pull/625
     @property
     def gripper_mount_quat_offset(self):
         return {"right": [-0.5, 0.5, 0.5, -0.5]}  # w, x, y, z
@@ -167,7 +180,7 @@ ROBOT_CLASS_MAPPING["CustomPanda"] = FixedBaseRobot
 register_gripper(CustomInspireRightHand)
 
 
-def show_grab_site(env, grab_pos, grab_ori_mat):
+def show_grab_site(env, grab_pos, grab_ori_mat, approach_len=0.3):
     # mark the grab site
     viewer = env.viewer.viewer
     mujoco.mjv_initGeom(
@@ -196,7 +209,7 @@ def show_grab_site(env, grab_pos, grab_ori_mat):
         type=mujoco.mjtGeom.mjGEOM_LINE,
         width=0.01,
         from_=grab_pos,
-        to=grab_pos + 0.15 * approach_vec,
+        to=grab_pos + approach_len * approach_vec,
     )
 
     # Gripper closing
@@ -220,61 +233,83 @@ def show_grab_site(env, grab_pos, grab_ori_mat):
     env.viewer.update()
 
 
-# robot = "PandaDexRH"
-robot = "CustomPanda"
+###################################################################################
+if __name__ == "__main__":
+    # NOTE: manually correcting offset. TODO: try to get rid of this?
+    # There is also angle offset. May be due to NOT using the correct driver-angle mapping...?
+    GRAB_SITE_OFFSET = np.array([0, -.016, -.008])
 
-controller_config = robosuite.load_part_controller_config(default_controller="OSC_POSE")
-controller_config["input_type"] = "absolute"
-controller_config["input_ref_frame"] = "world"
-# controller_config["damping_ratio"] = 3  # make robot slower
-controller_config = refactor_composite_controller_config(controller_config, robot, ["right"])
-# Match to robosuite/controllers/config/robots/default_panda_dex.json
-controller_config["body_parts"]["right"]["gripper"]["use_action_scaling"] = False
+    TEST_EEF_MOVE = True
+    TARGET_POS = np.array([0, 0, .95])
+    TARGET_ORI_MAT = np.array([[0, 0, 1], [0, 1, 0], [-1, 0, 0]])  # approach: -z, grab: +y
 
-# NOTE: consider using mink or curobo along with the default OSC delta controller
-env = robosuite.make(
-    "Lift",
-    robots=[robot],
-    controller_configs=controller_config,
-    has_renderer=True,
-    has_offscreen_renderer=True,
-    ignore_done=True,
-    use_object_obs=True,
-    use_camera_obs=True,
-    control_freq=20,
-)
+    # NOTE: This script will open and close the gripper. -1 is closed, 1 is open
+    gripper_seq = [-1.0] * 10 + list(np.arange(-1, 1, 0.042)) + [1.0] * 2 + list(np.arange(1, -1, -0.042))
 
-env.reset()
-env.step(np.zeros(7))
+    ### Setup the robot and env
+    # robot = "PandaDexRH"
+    robot = "CustomPanda"
 
-gripper = env.robots[0].gripper["right"]
+    controller_config = robosuite.load_part_controller_config(default_controller="OSC_POSE")
+    controller_config["input_type"] = "absolute"
+    controller_config["input_ref_frame"] = "world"
+    # controller_config["damping_ratio"] = 3  # make robot slower
+    controller_config = refactor_composite_controller_config(controller_config, robot, ["right"])
+    # Match to robosuite/controllers/config/robots/default_panda_dex.json
+    controller_config["body_parts"]["right"]["gripper"]["use_action_scaling"] = False
 
-# -1 is closed, 1 is open
-gripper_seq = [-1.0] * 10 + list(np.arange(-1, 1, 0.042)) + [1.0] * 2 + list(np.arange(1, -1, -0.042))
+    # NOTE: consider using mink or curobo along with the default OSC delta controller
+    env = robosuite.make(
+        "Lift",
+        robots=[robot],
+        controller_configs=controller_config,
+        has_renderer=True,
+        has_offscreen_renderer=True,
+        ignore_done=True,
+        use_object_obs=True,
+        use_camera_obs=True,
+        control_freq=20,
+    )
 
-# See env.robots[0].part_controllers for arm and hand control
-ref_id = env.sim.model.site_name2id("gripper0_right_grip_site")
-eef_pos = env.sim.data.site_xpos[ref_id]
-eef_quat = T.mat2quat(env.sim.data.site_xmat[ref_id].reshape((3, 3)))
-eef_ori_aa = T.quat2axisangle(eef_quat)
+    env.reset()
+    env.step(np.zeros(7))
 
-# Keep the gripper pos and ori constant
-eef_pose = np.zeros(7)  # OSC_POSE
-eef_pose[:3] = eef_pos
-eef_pose[3:6] = eef_ori_aa
+    gripper = env.robots[0].gripper["right"]
+    gripper.set_grab_site_offset(GRAB_SITE_OFFSET)
 
-while True:
-    for grip_type in list(gripper.grip_info.keys()):
-        gripper.set_grip_type(grip_type)
-        print("Playing grip:", grip_type)
+    ### Default eef pose, which is the initial pose
+    # See env.robots[0].part_controllers for arm and hand control
+    ref_id = env.sim.model.site_name2id("gripper0_right_grip_site")
+    eef_pos = env.sim.data.site_xpos[ref_id]
 
-        grab_pos, grab_ori_mat = gripper.get_grab_site_from_curr_eef(env, grip_type)
-        show_grab_site(env, grab_pos, grab_ori_mat)
+    # T.mat2quat() -> T.quat2axisangle() is the same as Rotation.from_matrix().as_rotvec()
+    eef_quat = T.mat2quat(env.sim.data.site_xmat[ref_id].reshape((3, 3)))
+    eef_ori_aa = T.quat2axisangle(eef_quat)
 
-        for _ in range(3):
-            for i in range(len(gripper_seq)):
-                eef_pose[-1] = gripper_seq[i]
-                env.step(eef_pose)
-                time.sleep(0.02)
+    # Keep the gripper pos and ori constant
+    eef_pose = np.zeros(7)  # OSC_POSE
+    eef_pose[:3] = eef_pos
+    eef_pose[3:6] = eef_ori_aa
 
-print("Done.")
+    while True:
+        for grip_type in list(gripper.grip_info.keys()):
+            gripper.set_grip_type(grip_type)
+            print("Playing grip:", grip_type)
+
+            if TEST_EEF_MOVE:
+                eef_pos, eef_ori_aa = gripper.get_eef_pose_for_grab(TARGET_POS, TARGET_ORI_MAT)
+                eef_pose[:3] = eef_pos
+                eef_pose[3:6] = eef_ori_aa
+
+            for _ in range(3):
+                for i in range(len(gripper_seq)):
+                    eef_pose[-1] = gripper_seq[i]
+                    env.step(eef_pose)
+
+                    # Visualize the grab site
+                    grab_pos, grab_ori_mat = gripper.get_grab_site_from_curr_eef(env)
+                    show_grab_site(env, grab_pos, grab_ori_mat)
+
+                    time.sleep(0.02)
+
+    print("Done.")

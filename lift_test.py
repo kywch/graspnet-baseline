@@ -60,28 +60,171 @@ def make_env(camera_name, camera_height, camera_width):
     return env
 
 
-def get_net(num_view=300, checkpoint_path="checkpoint-rs.tar"):
-    # Init the model
-    net = GraspNet(
-        input_feature_dim=0,
-        num_view=num_view,
-        num_angle=12,
-        num_depth=4,
-        cylinder_radius=0.05,
-        hmin=-0.02,
-        hmax_list=[0.01, 0.02, 0.03, 0.04],
-        is_training=False,
-    )
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    net.to(device)
-    # Load checkpointcloud_masked
-    checkpoint = torch.load(checkpoint_path)
-    net.load_state_dict(checkpoint["model_state_dict"])
-    start_epoch = checkpoint["epoch"]
-    print("-> loaded checkpoint %s (epoch: %d)" % (checkpoint_path, start_epoch))
-    # set model to eval mode
-    net.eval()
-    return net
+class ExtendedCameraInfo(CameraInfo):
+    def __init__(self, sim, camera_name, camera_height, camera_width):
+        camera_height = float(camera_height)
+        camera_width = float(camera_width)
+        intrinsic = CU.get_camera_intrinsic_matrix(sim, camera_name, camera_height, camera_width)
+        super().__init__(
+            camera_width, camera_height, intrinsic[0][0], intrinsic[1][1], intrinsic[0][2], intrinsic[1][2], scale=1.0
+        )
+
+        # camera frame (for depth map) <-> world frame <-> camera pixel
+        self.world_to_pixel_mat = CU.get_camera_transform_matrix(sim, camera_name, camera_height, camera_width)
+        self.camera_to_world_mat = CU.get_camera_extrinsic_matrix(sim, camera_name)
+        self.camera_to_pixel_mat = self.world_to_pixel_mat @ self.camera_to_world_mat
+
+    def get_pixel_coords(self, world_coords):
+        return project_world_to_pixel(
+            points=world_coords,
+            world_to_camera_transform=self.world_to_pixel_mat,
+            camera_height=self.height,
+            camera_width=self.width,
+        ).astype(np.int64)
+
+
+class GraspNetRunner:
+    def __init__(
+        self,
+        camera,
+        graspnet_path,
+        num_view=300,
+        num_focus_sample=5000,
+        num_random_sample=15000,
+        pixel_dist_thresh=50,
+        collision_voxel_size=0.01,
+        collision_thresh=0.01,
+    ):
+        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        self._load_graspnet(graspnet_path, num_view)
+
+        self.camera = camera
+        self.world_to_pixel_mat = camera.world_to_pixel_mat
+        self.camera_to_world_mat = camera.camera_to_world_mat
+        self.camera_to_pixel_mat = camera.camera_to_pixel_mat
+
+        # Vars for get_grasp
+        self.num_focus_sample = num_focus_sample
+        self.num_random_sample = num_random_sample
+        self.pixel_dist_thresh = pixel_dist_thresh
+        self.collision_voxel_size = collision_voxel_size
+        self.collision_thresh = collision_thresh
+
+        xmap = np.arange(self.camera.width)
+        ymap = np.arange(self.camera.height)
+        self._xmap, self._ymap = np.meshgrid(xmap, ymap)
+
+    def _load_graspnet(self, graspnet_path, num_view):
+        # Init the model
+        self.network = GraspNet(
+            input_feature_dim=0,
+            num_view=num_view,
+            num_angle=12,
+            num_depth=4,
+            cylinder_radius=0.05,
+            hmin=-0.02,
+            hmax_list=[0.01, 0.02, 0.03, 0.04],
+            is_training=False,
+        )
+        self.network.to(self.device)
+
+        # Load checkpointcloud_masked
+        checkpoint = torch.load(graspnet_path)
+        self.network.load_state_dict(checkpoint["model_state_dict"])
+        start_epoch = checkpoint["epoch"]
+        print("-> loaded checkpoint %s (epoch: %d)" % (graspnet_path, start_epoch))
+
+        # set model to eval mode
+        self.network.eval()
+
+    def get_grasp(self, color_map, depth_map, workspace_mask, focus_pixel, visualize=False):
+        # Prepare the point cloud
+        cloud = create_point_cloud_from_depth_image(depth_map, self.camera, organized=True)
+        cloud_masked = cloud[workspace_mask]
+        color_masked = color_map[workspace_mask]
+
+        cloud_o3d = o3d.geometry.PointCloud()
+        cloud_o3d.points = o3d.utility.Vector3dVector(cloud_masked.astype(np.float32))
+        cloud_o3d.colors = o3d.utility.Vector3dVector(color_masked.astype(np.float32))
+
+        # Sampling points
+        focus_area = (
+            np.sqrt((self._xmap - focus_pixel[1]) ** 2 + (self._ymap - focus_pixel[0]) ** 2) < self.pixel_dist_thresh
+        )
+        focus_cand = np.argwhere(focus_area[workspace_mask]).squeeze()
+        assert len(focus_cand) > self.num_focus_sample, "not enough points in the focus area"
+        focus_idxs = np.random.choice(focus_cand, self.num_focus_sample, replace=False)
+
+        random_cand = np.argwhere(~focus_area[workspace_mask]).squeeze()
+        assert len(random_cand) > self.num_random_sample, "not enough points in the random area"
+        random_idxs = np.random.choice(random_cand, self.num_random_sample, replace=False)
+
+        idxs = np.concatenate([focus_idxs, random_idxs], axis=0)
+        cloud_sampled = cloud_masked[idxs]
+        color_sampled = color_masked[idxs]
+
+        # Get grasps
+        with torch.no_grad():
+            end_points = self.network(
+                {
+                    "point_clouds": torch.from_numpy(cloud_sampled[np.newaxis].astype(np.float32)).to(self.device),
+                    "cloud_colors": color_sampled,  # not used in the network
+                }
+            )
+            grasp_preds = pred_decode(end_points)
+
+        gg_array = grasp_preds[0].detach().cpu().numpy()
+        gg = GraspGroup(gg_array)
+
+        # Filter grasps with the point(or object) of interest
+        # by back projecting the grasp centers (camera frame) to the pixels
+        grasp_pixels = project_world_to_pixel(
+            points=gg.translations,
+            world_to_camera_transform=self.camera_to_pixel_mat,
+            camera_height=self.camera.height,
+            camera_width=self.camera.width,
+        ).astype(np.int64)
+        distance_mask = np.linalg.norm(grasp_pixels - focus_pixel, axis=1) < PIXEL_DIST_THRESH
+        gg = gg[distance_mask]
+
+        if visualize:
+            self.visualize_grasp_points(depth_map, grasp_pixels, focus_pixel, distance_mask)
+
+        # Collision detection
+        mfcdetector = ModelFreeCollisionDetector(np.array(cloud_o3d.points), self.collision_voxel_size)
+        collision_mask = mfcdetector.detect(gg, approach_dist=0.05, collision_thresh=self.collision_thresh)
+        gg = gg[~collision_mask]
+
+        if len(gg) == 0:
+            return gg
+
+        # Transform grasps to the world frame, then filter based on approach vector
+        gg.transform(self.camera_to_world_mat)
+
+        # Filter grasps with approach vector
+        approach_vectors = gg.rotation_matrices[:, :, 0]
+        assert np.abs(np.linalg.norm(approach_vectors[0]) - 1) < 1e-3, "Approach vector must be unit vector"
+        cos_angle = np.arccos(np.clip(np.dot(approach_vectors, np.array([0, 0, -1])), -1, 1))
+        approach_mask = np.abs(np.degrees(cos_angle)) < 30
+        gg = gg[approach_mask]
+
+        return gg
+
+    def visualize_grasp_points(self, depth_map, grasp_pixels, focus_pixel, distance_mask):
+        norm_depth = (depth_map - depth_map.min()) / (depth_map.max() - depth_map.min())
+        norm_depth = (norm_depth * 255).astype(np.uint8)[:, :, np.newaxis]
+        norm_depth = np.repeat(norm_depth, 3, axis=2)
+
+        # Color-marking the pixels
+        norm_depth[focus_pixel[0], focus_pixel[1], 0] = 255  # red dot
+        for gp, d in zip(grasp_pixels, distance_mask):
+            if d:
+                norm_depth[gp[0], gp[1], 1] = 255  # green dots
+            else:
+                norm_depth[gp[0], gp[1], :] = 255  # white dots
+
+        pil_depth = Image.fromarray(norm_depth)
+        pil_depth.show()
 
 
 if __name__ == "__main__":
@@ -90,18 +233,13 @@ if __name__ == "__main__":
 
     env = make_env(camera_name, camera_height, camera_width)
     obs_dict = env.reset()
-    sim = env.sim
 
     #############################################################################
     ### check transformations
     # camera frame (for depth map) <-> world frame <-> camera pixel
+    camera = ExtendedCameraInfo(env.sim, camera_name, camera_height, camera_width)
 
-    world_to_pixel = CU.get_camera_transform_matrix(
-        sim=env.sim,
-        camera_name=camera_name,
-        camera_height=camera_height,
-        camera_width=camera_width,
-    )
+    world_to_pixel = camera.world_to_pixel_mat
     pixel_to_world = np.linalg.inv(world_to_pixel)
 
     # (0, 0, 0) in world frame -> (719, 640) in pixel frame
@@ -112,7 +250,7 @@ if __name__ == "__main__":
         camera_width=camera_width,
     ).astype(np.int64)
 
-    camera_to_world = CU.get_camera_extrinsic_matrix(sim=env.sim, camera_name=camera_name)
+    camera_to_world = camera.camera_to_world_mat
 
     # <camera mode="fixed" name="agentview" pos="0.5 0 1.35" quat="0.653 0.271 0.271 0.653"/>
     camera_origin_in_world = camera_to_world[:3, 3]
@@ -136,12 +274,7 @@ if __name__ == "__main__":
         camera_width=camera_width,
     ).astype(np.int64)
 
-    obj_pixel_from_world = project_world_to_pixel(
-        points=obj_pos,
-        world_to_camera_transform=world_to_pixel,
-        camera_height=camera_height,
-        camera_width=camera_width,
-    ).astype(np.int64)
+    obj_pixel_from_world = camera.get_pixel_coords(obj_pos)
 
     assert np.allclose(obj_pixel_from_camera, obj_pixel_from_world)
 
@@ -174,121 +307,18 @@ if __name__ == "__main__":
 
     #############################################################################
     ### graspnet pipeline
-    color = obs_dict["{}_image".format(camera_name)][::-1] / 255.0
-    depth = CU.get_real_depth_map(sim=env.sim, depth_map=obs_dict["{}_depth".format(camera_name)][::-1]).squeeze()
+    graspnet_runner = GraspNetRunner(camera, "checkpoint-rs.tar")
 
-    # create point cloud
-    intrinsic = CU.get_camera_intrinsic_matrix(
-        sim=env.sim,
-        camera_name=camera_name,
-        camera_height=camera_height,
-        camera_width=camera_width,
-    )
-    camera = CameraInfo(
-        camera_width, camera_height, intrinsic[0][0], intrinsic[1][1], intrinsic[0][2], intrinsic[1][2], scale=1.0
-    )
-    cloud = create_point_cloud_from_depth_image(depth, camera, organized=True)
+    color_map = obs_dict["{}_image".format(camera_name)][::-1] / 255.0
+    depth_map = CU.get_real_depth_map(sim=env.sim, depth_map=obs_dict["{}_depth".format(camera_name)][::-1]).squeeze()
 
-    # get valid points
-    workspace_mask = np.zeros_like(depth).astype(bool)
-    workspace_mask[200:520, 400:880] = True  # manually set workspace for now
+    # Manually set workspace for now
+    workspace_mask = np.zeros_like(depth_map).astype(bool)
+    workspace_mask[200:520, 400:880] = True
 
-    cloud_masked = cloud[workspace_mask]
-    color_masked = color[workspace_mask]
-
-    cloud_o3d = o3d.geometry.PointCloud()
-    cloud_o3d.points = o3d.utility.Vector3dVector(cloud_masked.astype(np.float32))
-    cloud_o3d.colors = o3d.utility.Vector3dVector(color_masked.astype(np.float32))
-    # o3d.visualization.draw_geometries([cloud_o3d])
-
-    net = get_net()
-    num_focus_samples = 5000
-    num_random_samples = 15000
-
-    def get_grasp():
-        # uniform sample across the workspace: 15k
-        # focus sample around the object: 5k
-
-        xmap = np.arange(camera.width)
-        ymap = np.arange(camera.height)
-        xmap, ymap = np.meshgrid(xmap, ymap)
-
-        focus_area = np.sqrt((xmap - obj_pixel[1]) ** 2 + (ymap - obj_pixel[0]) ** 2) < PIXEL_DIST_THRESH
-        focus_cand = np.argwhere(focus_area[workspace_mask]).squeeze()
-        assert len(focus_cand) > num_focus_samples, "not enough points in the focus area"
-        focus_idxs = np.random.choice(focus_cand, num_focus_samples, replace=False)
-
-        random_cand = np.argwhere(~focus_area[workspace_mask]).squeeze()
-        assert len(random_cand) > num_random_samples, "not enough points in the random area"
-        random_idxs = np.random.choice(random_cand, num_random_samples, replace=False)
-
-        idxs = np.concatenate([focus_idxs, random_idxs], axis=0)
-        cloud_sampled = cloud_masked[idxs]
-        color_sampled = color_masked[idxs]
-
-        # Prepare the input to graspnet
-        end_points = dict()
-        cloud_sampled = torch.from_numpy(cloud_sampled[np.newaxis].astype(np.float32))
-        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-        cloud_sampled = cloud_sampled.to(device)
-        end_points["point_clouds"] = cloud_sampled
-        end_points["cloud_colors"] = color_sampled  # not used in the network
-
-        #############################################################################
-        ### get grasps
-        with torch.no_grad():
-            end_points = net(end_points)
-            grasp_preds = pred_decode(end_points)
-        gg_array = grasp_preds[0].detach().cpu().numpy()
-        gg = GraspGroup(gg_array)
-
-        ### filter grasps with the point(or object) of interest
-        # back project grasp centers (camera frame) to the pixels
-        grasp_pixels = project_world_to_pixel(
-            points=gg.translations,
-            world_to_camera_transform=world_to_pixel @ camera_to_world,
-            camera_height=camera_height,
-            camera_width=camera_width,
-        ).astype(np.int64)
-        distance_mask = np.linalg.norm(grasp_pixels - obj_pixel, axis=1) < PIXEL_DIST_THRESH
-
-        # Inspect grasp pixels vs. object pixels
-        if True:
-            norm_depth = (depth_map - depth_map.min()) / (depth_map.max() - depth_map.min())
-            norm_depth = np.repeat((norm_depth * 255).astype(np.uint8), 3, axis=2)
-            norm_depth[obj_pixel[0], obj_pixel[1], 0] = 255  # red dot
-            for gp, d in zip(grasp_pixels, distance_mask):
-                if d:
-                    norm_depth[gp[0], gp[1], 1] = 255  # green dots
-                else:
-                    norm_depth[gp[0], gp[1], :] = 255  # white dots
-
-            pil_depth = Image.fromarray(norm_depth)
-            pil_depth.show()
-
-        gg = gg[distance_mask]
-
-        ### collision detection
-        voxel_size = 0.01
-        collision_thresh = 0.01
-        mfcdetector = ModelFreeCollisionDetector(np.array(cloud_o3d.points), voxel_size)
-        collision_mask = mfcdetector.detect(gg, approach_dist=0.05, collision_thresh=collision_thresh)
-        gg = gg[~collision_mask]
-
-        ### transform grasps to the world frame, then filter based on approach vector
-        gg.transform(camera_to_world)
-
-        # prefer the grippers that come from above
-        approach_vectors = gg.rotation_matrices[:, :, 0]
-        assert np.abs(np.linalg.norm(approach_vectors[0]) - 1) < 1e-3, "Approach vector must be unit vector"
-        cos_angle = np.arccos(np.clip(np.dot(approach_vectors, np.array([0, 0, -1])), -1, 1))
-        approach_mask = np.abs(np.degrees(cos_angle)) < 30
-        gg = gg[approach_mask]
-
-        return gg
-
+    ### Get grasps
     while True:
-        gg = get_grasp()
+        gg = graspnet_runner.get_grasp(color_map, depth_map, workspace_mask, obj_pixel, visualize=True)
         if len(gg) > 0:
             gg.nms()
             gg.sort_by_score()
@@ -311,6 +341,7 @@ if __name__ == "__main__":
 
     switch_axis = np.array([[0, 0, 1], [1, 0, 0], [0, 1, 0]])
     # NOTE: when the rotation matrix is identity, the gripper should face toward the x-axis, flat on x-y plane
+    # target_ori = Rotation.from_matrix(switch_axis).as_rotvec().tolist()
     target_ori = Rotation.from_matrix(best_grasp.rotation_matrix @ switch_axis).as_rotvec().tolist()
     # target_ori = [0, 0, 0]
 
