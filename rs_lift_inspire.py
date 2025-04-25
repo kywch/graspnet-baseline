@@ -23,9 +23,7 @@ register_robot(CustomPanda)
 ROBOT_CLASS_MAPPING["CustomPanda"] = FixedBaseRobot
 register_gripper(CustomInspireRightHand)
 
-# NOTE: correcting offset don't seem to work well
-# GRAB_SITE_OFFSET = np.array([0, -.016, -.008])
-# GRAB_SITE_OFFSET = np.array([0, -.03, -.015])
+GRAB_SITE_OFFSET = np.array([-0.01, 0.02, 0])  # in the grip frame
 
 
 # Camera choices: ["frontview", "birdview", "agentview", "robot0_robotview", "robot0_eye_in_hand"]
@@ -91,8 +89,7 @@ if __name__ == "__main__":
     workspace_mask[200:520, 400:880] = True
 
     env = make_env(camera_name, camera_height, camera_width)
-    gripper = env.robots[0].gripper["right"]
-    # gripper.set_grab_site_offset(GRAB_SITE_OFFSET)
+    grip_type_list = list(env.robots[0].gripper["right"].grip_info.keys())
 
     camera = ExtendedCameraInfo(env.sim, camera_name, camera_height, camera_width)
     graspnet_runner = GraspNetRunner(camera, "checkpoint-rs.tar")
@@ -105,11 +102,15 @@ if __name__ == "__main__":
     lift_pose = np.array([0, 0, 1.0, 0, 0, 0, -1])  # close gripper
 
     while True:
-        for grip_type in list(gripper.grip_info.keys()):
-            gripper.set_grip_type(grip_type)
+        for grip_type in grip_type_list:
             print("\nPlaying grip:", grip_type)
 
             obs_dict = env.reset()
+
+            # NOTE: gripper instance seems to change with env.reset()
+            gripper = env.robots[0].gripper["right"]
+            gripper.set_grip_type(grip_type)
+            gripper.set_grab_site_offset(GRAB_SITE_OFFSET)
 
             obj_pos = obs_dict["object-state"][:3]  # in world frame
             color_map = obs_dict["{}_image".format(camera_name)][::-1] / 255.0
@@ -132,7 +133,7 @@ if __name__ == "__main__":
 
             best_grasp = Grasp(gg[0].grasp_array)
             # To compensate the z-underestimation, go a bit deeper
-            grasp_pos = best_grasp.translation + 0.04 * best_grasp.rotation_matrix[:, 0]
+            grasp_pos = best_grasp.translation + 0.03 * best_grasp.rotation_matrix[:, 0]
             grasp_ori_aa = Rotation.from_matrix(best_grasp.rotation_matrix).as_rotvec()
 
             ready_pose[:3] = best_grasp.translation - 0.2 * best_grasp.rotation_matrix[:, 0]

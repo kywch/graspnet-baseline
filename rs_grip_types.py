@@ -83,7 +83,6 @@ class CustomInspireRightHand(InspireRightHand):
         assert grip_type in self.grip_info, "Gripper type {} not found in gripper info!".format(grip_type)
         self._grip_type = grip_type
 
-    # TODO: offset should be set for each grip type, and in the gripper frame
     def set_grab_site_offset(self, offset):
         assert len(offset) == 3, "Offset must be a 3-element array"
         self._grab_site_offset = np.array(offset)
@@ -92,12 +91,13 @@ class CustomInspireRightHand(InspireRightHand):
         action_to_idx = 10  # int(self.grip_info[self._grip_type]["idx_scale"])  # middle value
         width_key = self.grip_info[grip_type]["valid_widths"][action_to_idx]
 
-        trans = np.array(self._width_angle_dict[grip_type][width_key]["translation"])
-        trans[0] -= 0.0078  # subtract the ring of metal, so set the origin to the center of wrist
-
-        # inverse rotation to make it grip -> wrist frame
         rot_mat = np.array(self._width_angle_dict[grip_type][width_key]["rotation"])
-        # rot_mat = np.linalg.inv(rot_mat)
+
+        # get the gripper offset in the wrist frame
+        offset = rot_mat @ self._grab_site_offset
+
+        trans = np.array(self._width_angle_dict[grip_type][width_key]["translation"]) + offset
+        trans[0] -= 0.0078  # subtract the ring of metal, so set the origin to the center of wrist
 
         return T.make_pose(trans, rot_mat)  # 4x4 mat
 
@@ -120,13 +120,13 @@ class CustomInspireRightHand(InspireRightHand):
         grab_ori_mat = T.quat2mat(grab_ori_quat)
 
         # Apply offset to the target gripper site
-        return grab_pos - self._grab_site_offset, grab_ori_mat
+        return grab_pos, grab_ori_mat
 
     def get_eef_pose_for_grab(self, grab_pos, grab_ori_mat):
         """Given grab pos and ori_aa, return the eef pose to feed to the controller"""
 
         # Apply offset to the target gripper site
-        grab_site_hmat = T.make_pose(grab_pos + self._grab_site_offset, grab_ori_mat)
+        grab_site_hmat = T.make_pose(grab_pos, grab_ori_mat)
         
         eef_hmat = grab_site_hmat @ self.get_inv_grip_hmat(self._grip_type)
         eef_pos, eef_quat = T.mat2pose(eef_hmat)
@@ -237,7 +237,7 @@ def show_grab_site(env, grab_pos, grab_ori_mat, approach_len=0.3):
 if __name__ == "__main__":
     # NOTE: manually correcting offset. TODO: try to get rid of this?
     # There is also angle offset. May be due to NOT using the correct driver-angle mapping...?
-    GRAB_SITE_OFFSET = np.array([0, -.016, -.008])
+    GRAB_SITE_OFFSET = np.array([-0.01, 0.02, 0])  # in the grip frame
 
     TEST_EEF_MOVE = True
     TARGET_POS = np.array([0, 0, .95])
