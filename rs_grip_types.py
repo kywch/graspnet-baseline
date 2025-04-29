@@ -91,7 +91,10 @@ class CustomInspireRightHand(InspireRightHand):
         action_to_idx = 10  # int(self.grip_info[self._grip_type]["idx_scale"])  # middle value
         width_key = self.grip_info[grip_type]["valid_widths"][action_to_idx]
 
-        rot_mat = np.array(self._width_angle_dict[grip_type][width_key]["rotation"])
+        # Apply manual rot offset (z axis, +20 deg) to the given rotation mat
+        rot_offset = T.quat2mat(np.array([0, 0, 0.174, 0.985]))
+
+        rot_mat = rot_offset @ np.array(self._width_angle_dict[grip_type][width_key]["rotation"])
 
         # get the gripper offset in the wrist frame
         offset = rot_mat @ self._grab_site_offset
